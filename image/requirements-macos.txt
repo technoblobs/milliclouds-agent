@@ -1,0 +1,10 @@
+# Native Apple Silicon (MPS). Do not use the NVIDIA Docker image on a Mac.
+torch
+transformers
+accelerate
+safetensors
+sentencepiece
+protobuf
+pillow
+huggingface_hub
+git+https://github.com/huggingface/diffusers.git

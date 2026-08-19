@@ -1,0 +1,11 @@
+MilliCloud image runner
+Third-party model (downloaded at first job, not vendored in this image):
+
+  FLUX.2 [klein] 4B
+  Copyright (c) Black Forest Labs Inc.
+  License: Apache License 2.0
+  https://huggingface.co/black-forest-labs/FLUX.2-klein-4B
+
+You must retain this NOTICE and the Apache 2.0 license text if you
+redistribute the weights. Do not ship FLUX.2 [dev] or Klein 9B in this
+product without a commercial license from Black Forest Labs.
