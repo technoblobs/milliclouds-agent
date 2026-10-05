@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -106,6 +107,8 @@ def find_resume(path: str | None) -> str | None:
 
 
 def main() -> None:
+    # The image defaults to root. Keep adapter files readable by the host user.
+    os.umask(0o022)
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", required=True)
     args = parser.parse_args()

@@ -1007,6 +1007,38 @@ def _zip_latest_checkpoint(ckpt_dir: Path, dest: Path) -> Path | None:
     return dest
 
 
+def _owned_by_user(path: Path) -> bool:
+    uid = os.getuid()
+    for dirpath, _dirnames, filenames in os.walk(path):
+        if Path(dirpath).stat().st_uid != uid:
+            return False
+        for name in filenames:
+            if (Path(dirpath) / name).stat().st_uid != uid:
+                return False
+    return True
+
+
+def _reclaim_mount(path: Path, image: str) -> None:
+    """A root container leaves root-owned files on the bind mount. The host user cannot read them."""
+    if _owned_by_user(path):
+        return
+    log(f"reclaiming root-owned files under {path}")
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--entrypoint", "chown",
+            "--security-opt", "label=disable",
+            "-v", f"{path.resolve()}:/data",
+            image,
+            "-R", f"{os.getuid()}:{os.getgid()}", "/data",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"no_libs: could not reclaim {path}: {detail}")
+
+
 def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoint) -> tuple[list[Path], dict]:
     """One QLoRA try. NVIDIA Docker only — Mac workers must not reach this."""
     if sys.platform == "darwin" or not has_nvidia():
@@ -1062,11 +1094,19 @@ def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoi
     image = settings.get("docker_image") or DEFAULT_LORA_DOCKER
     cache = Path(os.environ.get("LORA_CACHE") or (Path.home() / ".cache" / "millicloud-lora"))
     cache.mkdir(parents=True, exist_ok=True)
+    # The image has no USER, so Docker writes the adapter as root. On Fedora,
+    # SELinux also labels that mount so the agent cannot open it. Run as the
+    # host user and keep the directory label.
+    _reclaim_mount(cache, image)
+    _reclaim_mount(workdir, image)
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--security-opt", "label=disable",
         "-v", f"{workdir.resolve()}:/work",
         "-v", f"{cache.resolve()}:/cache",
         "-e", "HF_HOME=/cache/hf",
+        "-e", "HOME=/tmp",
         "-e", "PYTHONUNBUFFERED=1",
     ]
     if script.is_file():
