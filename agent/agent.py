@@ -990,6 +990,125 @@ def lora_train_script() -> Path:
     return here.parent / "lora" / "train.py"
 
 
+def lora_infer_script() -> Path:
+    env = os.environ.get("LORA_INFER")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parent
+    for p in (here.parent / "lora" / "infer.py", here / "infer.py"):
+        if p.is_file():
+            return p
+    return here.parent / "lora" / "infer.py"
+
+
+def _post_lora_try(try_id: str, payload: dict) -> None:
+    token = os.environ.get("RY_WORKER_TOKEN") or ""
+    api("POST", f"/agent/tries/{try_id}/complete", token, json=payload).raise_for_status()
+
+
+def run_lora_try(claim: dict) -> None:
+    """Generate the base answer and the adapter answer for one prompt."""
+    settings = claim.get("engine_settings") or {}
+    try_id = str(settings.get("try_id") or "")
+    if not try_id:
+        raise RuntimeError("try_failed: claim is missing try_id")
+    if sys.platform == "darwin" or not has_nvidia():
+        err = "no_gpu: comparing an adapter runs on NVIDIA workers only"
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+    if not shutil.which("docker"):
+        err = "no_libs: Docker is required. Build millicloud-lora:qwen on this host."
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+    script = lora_infer_script()
+    if not script.is_file():
+        err = "no_libs: lora/infer.py is missing next to the agent"
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+
+    if RENDER_MODE == "secure":
+        workdir = SANDBOX_ROOT / "jobs" / uuid.uuid4().hex
+        workdir.mkdir(parents=True, exist_ok=True)
+    elif RENDER_MODE == "trusted":
+        workdir = Path(tempfile.mkdtemp(prefix="ry_try_"))
+    else:
+        err = f"try_failed: unsupported RY_RENDER_MODE {RENDER_MODE}"
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+    try:
+        adapter_dir = workdir / "adapter"
+        out_dir = workdir / "out"
+        adapter_dir.mkdir()
+        out_dir.mkdir()
+        download_scene(settings["adapter_url"], adapter_dir / "adapter_model.safetensors")
+        download_scene(settings["adapter_config_url"], adapter_dir / "adapter_config.json")
+        shutil.copy(script, workdir / "infer.py")
+        job = {
+            "prompt": settings.get("prompt") or "",
+            "model_id": settings.get("model_id") or "",
+            "model_revision": settings.get("model_revision") or "main",
+            "adapter_dir": "/work/adapter",
+            "output": "/work/out/try_result.json",
+        }
+        (workdir / "lora-try.json").write_text(json.dumps(job), encoding="utf-8")
+        image = settings.get("docker_image") or DEFAULT_LORA_DOCKER
+        cache = Path(os.environ.get("LORA_CACHE") or (Path.home() / ".cache" / "millicloud-lora"))
+        cache.mkdir(parents=True, exist_ok=True)
+        _reclaim_mount(cache, image)
+        _reclaim_mount(workdir, image)
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--security-opt", "label=disable",
+            "--entrypoint", "python3",
+            "-v", f"{workdir.resolve()}:/work",
+            "-v", f"{cache.resolve()}:/cache",
+            "-e", "HF_HOME=/cache/hf",
+            "-e", "HOME=/tmp",
+            "-e", "PYTHONUNBUFFERED=1",
+            image, "/work/infer.py", "--job", "/work/lora-try.json",
+        ]
+        log(f"lora compare docker {image}")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            print(line, flush=True)
+            if render_should_stop():
+                proc.terminate()
+                proc.wait()
+                raise RuntimeError("Render aborted by operator")
+        code = proc.wait()
+        result_path = out_dir / "try_result.json"
+        if code != 0 or not result_path.is_file():
+            raise RuntimeError(f"try_failed: compare exited with code {code}")
+        saved = json.loads(result_path.read_text(encoding="utf-8"))
+        _post_lora_try(try_id, {
+            "success": True,
+            "base_text": str(saved.get("base") or "")[:8000],
+            "adapter_text": str(saved.get("adapter") or "")[:8000],
+        })
+        log("compare complete")
+    except Exception as e:
+        try:
+            _post_lora_try(try_id, {"success": False, "error": str(e)[:1900]})
+        except requests.RequestException:
+            pass
+        raise
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _zip_latest_checkpoint(ckpt_dir: Path, dest: Path) -> Path | None:
     """Pack the newest Trainer checkpoint-* directory. Skip if nothing was saved yet."""
     if not ckpt_dir.is_dir():
@@ -1933,7 +2052,7 @@ def main() -> int:
                 continue
 
             try:
-                r = api("POST", "/agent/poll", wtoken)
+                r = api("POST", "/agent/poll?supports=lora_try", wtoken)
                 if r.status_code == 200 and r.json():
                     claim = r.json()
                     cid = str(claim["chunk_id"]) if claim.get("chunk_id") else None
@@ -1946,11 +2065,17 @@ def main() -> int:
                     state["presence"] = "busy"
                     state["job_id"] = str(claim["job_id"])
                     state["chunk_id"] = str(claim["chunk_id"]) if claim.get("chunk_id") else None
-                    log(f"claimed chunk {state['chunk_id']} job {state['job_id']} "
-                        f"frames {claim['frame_start']}-{claim['frame_end']}")
+                    if claim.get("engine") == "lora_try":
+                        log(f"claimed compare job {state['job_id']}")
+                    else:
+                        log(f"claimed chunk {state['chunk_id']} job {state['job_id']} "
+                            f"frames {claim['frame_start']}-{claim['frame_end']}")
                     try:
                         _abort_render.clear()
-                        run_job(claim, claim["job_token"])
+                        if claim.get("engine") == "lora_try":
+                            run_lora_try(claim)
+                        else:
+                            run_job(claim, claim["job_token"])
                         state["presence"] = "idle"
                         _status["presence"] = "idle"
                         log("chunk finished — back to idle")
