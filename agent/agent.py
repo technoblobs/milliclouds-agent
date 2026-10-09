@@ -1040,8 +1040,21 @@ def run_lora_try(claim: dict) -> None:
         out_dir = workdir / "out"
         adapter_dir.mkdir()
         out_dir.mkdir()
-        download_scene(settings["adapter_url"], adapter_dir / "adapter_model.safetensors")
-        download_scene(settings["adapter_config_url"], adapter_dir / "adapter_config.json")
+        if settings.get("checkpoint_url"):
+            archive = workdir / "checkpoint.zip"
+            download_scene(settings["checkpoint_url"], archive)
+            extracted = workdir / "ckpt"
+            extracted.mkdir()
+            safe_extract(archive, extracted)
+            weight = next(extracted.rglob("adapter_model.safetensors"), None)
+            config = next(extracted.rglob("adapter_config.json"), None)
+            if weight is None or config is None:
+                raise RuntimeError("try_failed: checkpoint has no adapter files")
+            shutil.copy(weight, adapter_dir / "adapter_model.safetensors")
+            shutil.copy(config, adapter_dir / "adapter_config.json")
+        else:
+            download_scene(settings["adapter_url"], adapter_dir / "adapter_model.safetensors")
+            download_scene(settings["adapter_config_url"], adapter_dir / "adapter_config.json")
         shutil.copy(script, workdir / "infer.py")
         job = {
             "prompt": settings.get("prompt") or "",
@@ -1203,6 +1216,10 @@ def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoi
             "epochs": int(trial.get("epochs") or settings.get("epochs") or 1),
             "max_seq": int(trial.get("max_seq") or settings.get("max_seq") or 2048),
         },
+        "loss_on": settings.get("loss_on") or "full",
+        "early_stop": settings.get("early_stop", True),
+        "early_stop_patience": int(settings.get("early_stop_patience") or 2),
+        "eval_tail": int(settings.get("eval_tail") or 0),
     }
     if resume_for_job:
         job["resume"] = resume_for_job

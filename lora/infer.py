@@ -15,6 +15,22 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
+def load_base_model(model_id: str, revision: str, bnb):
+    """4-bit load. Gemma 4 is registered as a multimodal class, not a plain causal LM."""
+    kwargs = dict(
+        revision=revision,
+        quantization_config=bnb,
+        device_map="auto",
+        dtype=torch.bfloat16,
+    )
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except ValueError:
+        from transformers import AutoModelForImageTextToText
+
+        return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
+
+
 def log(msg: str) -> None:
     print(f"[lora] {msg}", flush=True)
 
@@ -64,13 +80,7 @@ def main() -> None:
     )
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            revision=revision,
-            quantization_config=bnb,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
+        model = load_base_model(model_id, revision, bnb)
     except Exception as e:
         fail(str(e))
     if tokenizer.pad_token is None:

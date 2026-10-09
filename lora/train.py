@@ -48,6 +48,44 @@ def _free_vram_mb() -> int | None:
         return None
 
 
+def _pair_from_obj(obj: dict, prompt_field: str, response_field: str) -> tuple[str, str]:
+    """Accept prompt/response, Alpaca instruction/output, or chat messages."""
+    prompt = str(obj.get(prompt_field) or "").strip()
+    response = str(obj.get(response_field) or "").strip()
+    if prompt and response:
+        return prompt, response
+    instruction = str(obj.get("instruction") or "").strip()
+    output = str(obj.get("output") or "").strip()
+    extra = str(obj.get("input") or "").strip()
+    if instruction and output:
+        if extra:
+            instruction = f"{instruction}\n\n{extra}"
+        return instruction, output
+    messages = obj.get("messages")
+    if isinstance(messages, list):
+        user = ""
+        assistant = ""
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").lower()
+            content = message.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict)
+                )
+            content = str(content or "").strip()
+            if role in ("user", "human") and content:
+                user = content
+            elif role in ("assistant", "gpt") and content:
+                assistant = content
+        if user and assistant:
+            return user, assistant
+    return "", ""
+
+
 def load_rows(
     path: Path,
     prompt_field: str,
@@ -69,12 +107,11 @@ def load_rows(
                 fail("scene_error", f"line {lineno} is not JSON: {e}")
             if not isinstance(obj, dict):
                 fail("scene_error", f"line {lineno} must be an object")
-            prompt = str(obj.get(prompt_field) or "").strip()
-            response = str(obj.get(response_field) or "").strip()
+            prompt, response = _pair_from_obj(obj, prompt_field, response_field)
             if not prompt or not response:
                 fail(
                     "scene_error",
-                    f"line {lineno} needs non-empty {prompt_field} and {response_field}",
+                    f"line {lineno} needs prompt/response, instruction/output, or messages",
                 )
             rows.append({"prompt": prompt, "response": response})
             if len(rows) >= limit:
@@ -87,6 +124,25 @@ def load_rows(
 
 def as_text(row: dict) -> str:
     return f"### Prompt:\n{row['prompt']}\n\n### Response:\n{row['response']}"
+
+
+def load_base_model(model_id: str, revision: str, bnb):
+    """4-bit load. Gemma 4 is registered as a multimodal class, not a plain causal LM."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    kwargs = dict(
+        revision=revision,
+        quantization_config=bnb,
+        device_map="auto",
+        dtype=torch.bfloat16,
+    )
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except ValueError:
+        from transformers import AutoModelForImageTextToText
+
+        return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
 
 
 def find_resume(path: str | None) -> str | None:
@@ -152,7 +208,8 @@ def main() -> None:
             AutoModelForCausalLM,
             AutoTokenizer,
             BitsAndBytesConfig,
-            DataCollatorForLanguageModeling,
+            DataCollatorForSeq2Seq,
+            EarlyStoppingCallback,
             Trainer,
             TrainerCallback,
             TrainingArguments,
@@ -169,8 +226,10 @@ def main() -> None:
         limit=int(dataset_spec.get("max_rows") or 50_000),
         min_rows=int(dataset_spec.get("min_rows") or 2),
     )
-    hold = max(1, len(rows) // 20)  # last 5%
-    train_rows, eval_rows = rows[:-hold], rows[-hold:]
+    eval_tail = int(job.get("eval_tail") or 0)
+    if eval_tail < 1 or eval_tail >= len(rows):
+        eval_tail = max(1, len(rows) // 20)  # last 5% when the user did not pass a validation file
+    train_rows, eval_rows = rows[:-eval_tail], rows[-eval_tail:]
     log(f"rows train={len(train_rows)} eval={len(eval_rows)}")
 
     trial = job.get("trial") or {}
@@ -189,6 +248,11 @@ def main() -> None:
     grad_accum = int(recipe.get("grad_accum") or 8)
     warmup = float(recipe.get("warmup_ratio") if recipe.get("warmup_ratio") is not None else 0.03)
     save_steps = int(recipe.get("save_steps") or 200)
+    loss_on = str(job.get("loss_on") or "full").lower()
+    if loss_on not in ("full", "response"):
+        loss_on = "full"
+    early_stop = bool(job.get("early_stop", True))
+    patience = max(1, min(8, int(job.get("early_stop_patience") or 2)))
     out_dir = Path(job["output_dir"])
     ckpt_dir = Path(job.get("checkpoint_dir") or (out_dir.parent / "ckpt"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +260,8 @@ def main() -> None:
 
     log(
         f"model={model_id}@{model_revision} rank={rank} lr={lr} "
-        f"epochs={epochs} max_seq={max_seq} modules={','.join(modules)}"
+        f"epochs={epochs} max_seq={max_seq} loss_on={loss_on} "
+        f"early_stop={early_stop} modules={','.join(modules)}"
     )
 
     bnb = BitsAndBytesConfig(
@@ -207,13 +272,7 @@ def main() -> None:
     )
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, revision=model_revision, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            revision=model_revision,
-            quantization_config=bnb,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
+        model = load_base_model(model_id, model_revision, bnb)
     except Exception as e:
         fail("model_load", str(e))
 
@@ -234,15 +293,25 @@ def main() -> None:
         ),
     )
 
-    def tokenize(batch: dict) -> dict:
-        return tokenizer(
-            [as_text({"prompt": p, "response": r}) for p, r in zip(batch["prompt"], batch["response"])],
-            truncation=True,
-            max_length=max_seq,
-        )
+    def encode_row(row: dict) -> dict:
+        prompt_text = f"### Prompt:\n{row['prompt']}\n\n### Response:\n"
+        eos = tokenizer.eos_token or ""
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
+        response_ids = tokenizer(row["response"] + eos, add_special_tokens=False).input_ids
+        ids = (prompt_ids + response_ids)[:max_seq]
+        if loss_on == "response":
+            cut = min(len(prompt_ids), len(ids))
+            labels = [-100] * cut + ids[cut:]
+        else:
+            labels = list(ids)
+        return {
+            "input_ids": ids,
+            "attention_mask": [1] * len(ids),
+            "labels": labels,
+        }
 
-    train_ds = Dataset.from_list(train_rows).map(tokenize, batched=True, remove_columns=["prompt", "response"])
-    eval_ds = Dataset.from_list(eval_rows).map(tokenize, batched=True, remove_columns=["prompt", "response"])
+    train_ds = Dataset.from_list([encode_row(row) for row in train_rows])
+    eval_ds = Dataset.from_list([encode_row(row) for row in eval_rows])
 
     class Progress(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):
@@ -250,8 +319,33 @@ def main() -> None:
             frac = min(0.99, state.global_step / total)
             print(f"[lora] progress {frac:.4f} step={state.global_step}/{total}", flush=True)
 
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            if logs.get("loss") is not None:
+                parts = [f"step={state.global_step}", f"loss={float(logs['loss']):.6f}"]
+                if logs.get("grad_norm") is not None:
+                    parts.append(f"grad_norm={float(logs['grad_norm']):.4f}")
+                if logs.get("learning_rate") is not None:
+                    parts.append(f"learning_rate={float(logs['learning_rate']):.8f}")
+                print("[lora] metric " + " ".join(parts), flush=True)
+            if logs.get("eval_loss") is not None:
+                print(
+                    f"[lora] eval_loss step={state.global_step} value={float(logs['eval_loss']):.6f}",
+                    flush=True,
+                )
+
         def on_save(self, args, state, control, **kwargs):
             print(f"[lora] checkpoint {args.output_dir}", flush=True)
+
+    updates_per_epoch = max(1, len(train_rows) // max(1, batch_size * grad_accum))
+    planned_steps = max(1, updates_per_epoch * epochs)
+    eval_steps = save_steps if planned_steps > save_steps * 2 else max(1, planned_steps // 4)
+    callbacks = [Progress()]
+    eval_strategy = "no"
+    if early_stop:
+        eval_strategy = "steps"
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience, early_stopping_threshold=0.0))
 
     training_args = TrainingArguments(
         output_dir=str(ckpt_dir),
@@ -264,10 +358,14 @@ def main() -> None:
         warmup_ratio=warmup,
         logging_steps=10,
         save_strategy="steps",
-        save_steps=save_steps,
-        save_total_limit=1,
+        save_steps=eval_steps if early_stop else save_steps,
+        save_total_limit=3,
         bf16=True,
-        eval_strategy="no",
+        eval_strategy=eval_strategy,
+        eval_steps=eval_steps,
+        load_best_model_at_end=early_stop,
+        metric_for_best_model="eval_loss" if early_stop else None,
+        greater_is_better=False if early_stop else None,
         report_to=[],
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -278,8 +376,9 @@ def main() -> None:
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
-        callbacks=[Progress()],
+        eval_dataset=eval_ds if early_stop else None,
+        data_collator=DataCollatorForSeq2Seq(tokenizer, label_pad_token_id=-100, padding=True),
+        callbacks=callbacks,
     )
     resume = find_resume(job.get("resume"))
     try:
@@ -293,10 +392,18 @@ def main() -> None:
     eval_metrics = trainer.evaluate(eval_dataset=eval_ds)
     val_loss = float(eval_metrics.get("eval_loss"))
     log(f"val_loss {val_loss:.6f}")
+    taken = int(trainer.state.global_step or 0)
+    planned = int(trainer.state.max_steps or taken)
+    early = early_stop and planned > 0 and taken < planned
+    if early:
+        log(f"early_stop step={taken} kept_best=1")
     model.save_pretrained(out_dir)
     result = {
         "val_loss": val_loss,
-        "global_step": int(trainer.state.global_step or 0),
+        "global_step": taken,
+        "early_stopped": early,
+        "best_step": int(getattr(trainer.state, "best_global_step", None) or taken),
+        "loss_on": loss_on,
         "model_id": model_id,
         "rank": rank,
         "lr": lr,
