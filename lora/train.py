@@ -13,16 +13,115 @@ A resumed job passes ``resume`` pointing at a previous Trainer checkpoint.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
 def log(msg: str) -> None:
     print(f"[lora] {msg}", flush=True)
+
+
+def _human_bytes(n: float) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def hub_download_bar():
+    """tqdm subclass that logs Hub downloads as normal lines.
+
+    huggingface_hub disables its bar when stderr is not a terminal, which is
+    how the trainer runs under the agent. A line at the start, every 10%, and
+    every 20 seconds while a large file is moving is what the console and the
+    website can show.
+    """
+    cached = getattr(hub_download_bar, "_cls", None)
+    if cached is not None:
+        return cached
+
+    from tqdm.auto import tqdm
+
+    class HubDownloadBar(tqdm):
+        saw_large = False
+        _lock = threading.Lock()
+        _MIN_BYTES = 8 * 1024 * 1024
+
+        def __init__(self, *args, **kwargs):
+            self._announced = False
+            self._last_pct = -1
+            self._last_log_at = 0.0
+            kwargs.pop("name", None)
+            kwargs["disable"] = False
+            kwargs["file"] = io.StringIO()
+            super().__init__(*args, **kwargs)
+            self._report()
+
+        def update(self, n=1):
+            shown = super().update(n)
+            self._report()
+            return shown
+
+        def refresh(self, *args, **kwargs):
+            shown = super().refresh(*args, **kwargs)
+            self._report()
+            return shown
+
+        def close(self):
+            self._report(final=True)
+            return super().close()
+
+        def _label(self) -> str:
+            desc = str(self.desc or "model file")
+            if "incomplete" in desc.lower():
+                return "model files"
+            return desc
+
+        def _report(self, final: bool = False) -> None:
+            total = float(self.total or 0)
+            if total < self._MIN_BYTES:
+                return
+            done = float(self.n or 0)
+            pct = min(100, int(100 * done / total))
+            now = time.monotonic()
+            with self._lock:
+                if not self._announced:
+                    self._announced = True
+                    type(self).saw_large = True
+                    self._last_pct = 0
+                    self._last_log_at = now
+                    log(
+                        f"downloading {self._label()} ({_human_bytes(total)}). "
+                        "A first run can sit here for several minutes."
+                    )
+                if self._last_pct >= 100:
+                    return
+                bucket = pct // 10 * 10
+                heartbeat = now - self._last_log_at >= 20 and pct < 100
+                if not final and bucket < self._last_pct + 10 and not heartbeat:
+                    return
+                if pct == 100 or final:
+                    self._last_pct = 100
+                elif bucket > self._last_pct:
+                    self._last_pct = bucket
+                self._last_log_at = now
+            note = " still downloading" if heartbeat and pct < 100 else ""
+            log(
+                f"download {self._label()} {pct}% "
+                f"({_human_bytes(done)} / {_human_bytes(total)}){note}"
+            )
+
+    hub_download_bar._cls = HubDownloadBar
+    return HubDownloadBar
 
 
 def fail(code: str, msg: str) -> None:
@@ -145,11 +244,14 @@ def load_base_model(model_id: str, revision: str, bnb):
     import torch
     from transformers import AutoModelForCausalLM
 
+    bar = hub_download_bar()
+    bar.saw_large = False
     kwargs = dict(
         revision=revision,
         quantization_config=bnb,
         device_map="auto",
         dtype=torch.bfloat16,
+        tqdm_class=bar,
     )
     try:
         return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
@@ -289,11 +391,18 @@ def main() -> None:
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
+    log(
+        f"fetching {model_id}@{model_revision}. "
+        "A download prints its percent below. A cached model stays quiet while the weights load onto the GPU."
+    )
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, revision=model_revision, use_fast=True)
         model = load_base_model(model_id, model_revision, bnb)
     except Exception as e:
         fail("model_load", str(e))
+    if not hub_download_bar().saw_large:
+        log(f"model weights already cached for {model_id}")
+    log("weights loaded, preparing the adapter")
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -374,7 +483,8 @@ def main() -> None:
         gradient_accumulation_steps=grad_accum,
         learning_rate=lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=warmup,
+        # Transformers 5 takes the warmup fraction here. warmup_ratio was removed.
+        warmup_steps=warmup,
         logging_steps=10,
         save_strategy="steps",
         save_steps=eval_steps if early_stop else save_steps,
