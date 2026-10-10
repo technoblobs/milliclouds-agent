@@ -233,7 +233,7 @@ def main() -> None:
             "no_libs",
             "training libraries missing ("
             + import_failure(e)
-            + "). Rebuild millicloud-lora:qwen and wait for 'trainer import ok'.",
+            + "). Rebuild millicloud-lora:qwen and wait for 'trainer torch ok'.",
         )
 
     prompt_field = str(dataset_spec.get("prompt_field") or "prompt")
