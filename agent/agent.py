@@ -29,6 +29,8 @@ from pathlib import Path
 
 import requests
 
+from eval_cache import EvalCache
+
 API = os.environ.get("RY_API", "").rstrip("/")
 POLL_INTERVAL = int(os.environ.get("RY_POLL_INTERVAL", "10"))
 HEARTBEAT_INTERVAL = 20
@@ -77,6 +79,9 @@ _status: dict = {
 }
 
 
+_eval_cache = EvalCache(log=lambda msg: print(f"[agent] {msg}", flush=True))
+
+
 def log(msg: str) -> None:
     line = f"[agent] {msg}"
     print(line, flush=True)
@@ -84,6 +89,9 @@ def log(msg: str) -> None:
         _log_shipper.add(line)
     elif _worker_log_shipper is not None:
         _worker_log_shipper.add(line)
+
+
+_eval_cache.log = log
 
 
 def _control_status() -> dict:
@@ -1055,6 +1063,15 @@ def run_lora_try(claim: dict) -> None:
         else:
             download_scene(settings["adapter_url"], adapter_dir / "adapter_model.safetensors")
             download_scene(settings["adapter_config_url"], adapter_dir / "adapter_config.json")
+        if _eval_cache.allowed():
+            saved = _eval_cache.answer(claim, adapter_dir / "adapter_model.safetensors", adapter_dir / "adapter_config.json", reclaim=_reclaim_mount)
+            _post_lora_try(try_id, {
+                "success": True,
+                "base_text": str(saved.get("base") or "")[:8000],
+                "adapter_text": str(saved.get("adapter") or "")[:8000],
+            })
+            log("compare complete")
+            return
         shutil.copy(script, workdir / "infer.py")
         job = {
             "prompt": settings.get("prompt") or "",
@@ -1956,6 +1973,7 @@ def worker_heartbeat_loop(wtoken: str, state: dict) -> None:
             _runtime_metrics = collect_runtime_metrics()
             specs["runtime_metrics"] = dict(_runtime_metrics)
             specs["render_mode"] = RENDER_MODE
+            specs["lora_cache"] = _eval_cache.status()
             specs["sandbox"] = {
                 "mode": RENDER_MODE,
                 "sidecar_required": RENDER_MODE == "secure",
@@ -1997,8 +2015,11 @@ def worker_heartbeat_loop(wtoken: str, state: dict) -> None:
             if r.status_code == 200:
                 data = r.json()
                 _run_policy = data.get("run_policy") or _run_policy
+                _eval_cache.provider = data.get("provider") or _eval_cache.provider
                 if data.get("command") == "abort_current":
                     abort_current_render("server command")
+                elif data.get("command") == "unload_eval":
+                    _eval_cache.unload("operator")
                 if data.get("render_mode") and data["render_mode"] != RENDER_MODE:
                     log(
                         f"render mode mismatch: API requires {data['render_mode']}, "
@@ -2092,6 +2113,7 @@ def main() -> int:
                         if claim.get("engine") == "lora_try":
                             run_lora_try(claim)
                         else:
+                            _eval_cache.unload("training job claimed")
                             run_job(claim, claim["job_token"])
                         state["presence"] = "idle"
                         _status["presence"] = "idle"
