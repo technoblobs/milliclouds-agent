@@ -84,6 +84,10 @@ Build this on the NVIDIA Linux host. A Mac image cannot see the GPU. One tag,
 ```dockerfile
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
+# Keep the image CUDA torch. Pip must not replace it.
+RUN python -c "import torch; open('/tmp/constraints.txt','w').write('torch=='+torch.__version__.split('+')[0]+'\n')"
+ENV PIP_CONSTRAINT=/tmp/constraints.txt
+
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir --upgrade pip \
@@ -94,8 +98,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
          "accelerate==1.15.0" \
          "datasets==3.6.0" \
          "safetensors>=0.8.0" \
-         sentencepiece protobuf huggingface_hub
+         sentencepiece protobuf "huggingface_hub>=1.31.0,<3" \
+    && pip install --no-cache-dir --no-deps \
+         torchvision==0.20.1 torchaudio==2.5.1 \
+         --index-url https://download.pytorch.org/whl/cu124 \
+    && python -c "import torch, torchvision; from transformers import AutoModelForCausalLM; from peft import LoraConfig; assert torch.version.cuda; print('trainer import ok', torch.__version__)"
 ```
+
+The `AutoModel` line in a failed job is Transformers 5 hiding a broken torch
+install. The build above freezes the CUDA torch from the base image, puts
+torchvision 0.20.1 back next to torch 2.5.1, and refuses to finish unless
+`AutoModelForCausalLM` imports. A finished build prints `trainer import ok`.
 
 Copy `lora/Dockerfile`, `lora/train.py`, and `lora/infer.py` onto the worker
 checkout, then build. On the Fedora host that is `~/work/milliclouds-agent`:
@@ -105,9 +118,10 @@ cd ~/work/milliclouds-agent
 docker build --platform linux/amd64 -t millicloud-lora:qwen lora/
 ```
 
-Stop the agent only when it is not inside an epoch, then start it again so the
-new `train.py` and `infer.py` are the ones it mounts. The image name stays
-`millicloud-lora:qwen`. Weights still cache in `~/.cache/millicloud-lora`.
+Leave the agent running. It reads `train.py` from the checkout on the next
+job, and the next `docker run` uses the new `millicloud-lora:qwen` tag. Queue
+again only after the build prints `trainer import ok`. Weights still cache in
+`~/.cache/millicloud-lora`.
 The first Gemma 4 or Phi-4 job downloads that model's weights. Qwen jobs keep
 using the weights already cached.
 

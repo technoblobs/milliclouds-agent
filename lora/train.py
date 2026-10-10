@@ -30,6 +30,20 @@ def fail(code: str, msg: str) -> None:
     raise SystemExit(2)
 
 
+def import_failure(exc: BaseException) -> str:
+    """Transformers 5 hides the missing module behind a generic AutoModel error."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = f"{type(cur).__name__}: {cur}"
+        if text not in parts:
+            parts.append(text)
+        cur = cur.__cause__ or cur.__context__
+    return " | ".join(parts)
+
+
 def _free_vram_mb() -> int | None:
     try:
         out = subprocess.run(
@@ -215,7 +229,12 @@ def main() -> None:
             TrainingArguments,
         )
     except ImportError as e:
-        fail("no_libs", f"training libraries missing ({e}). Build millicloud-lora:qwen.")
+        fail(
+            "no_libs",
+            "training libraries missing ("
+            + import_failure(e)
+            + "). Rebuild millicloud-lora:qwen and wait for 'trainer import ok'.",
+        )
 
     prompt_field = str(dataset_spec.get("prompt_field") or "prompt")
     response_field = str(dataset_spec.get("response_field") or "response")
