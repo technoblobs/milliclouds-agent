@@ -33,6 +33,7 @@ from eval_cache import EvalCache
 
 API = os.environ.get("RY_API", "").rstrip("/")
 POLL_INTERVAL = int(os.environ.get("RY_POLL_INTERVAL", "10"))
+POLL_WAIT = max(0, min(20, int(os.environ.get("RY_POLL_WAIT", "20"))))
 HEARTBEAT_INTERVAL = 20
 WORKER_HB_INTERVAL = 25
 LOG_FLUSH_INTERVAL = float(os.environ.get("RY_LOG_FLUSH_INTERVAL", "1.0"))
@@ -178,11 +179,11 @@ def start_control_panel() -> None:
     )
 
 
-def api(method: str, path: str, token: str, **kw) -> requests.Response:
+def api(method: str, path: str, token: str, timeout: int = 30, **kw) -> requests.Response:
     return requests.request(
         method, f"{API}{path}",
         headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
+        timeout=timeout,
         **kw,
     )
 
@@ -2081,7 +2082,7 @@ def main() -> int:
         _worker_log_shipper = WorkerLogShipper(wtoken)
         _worker_log_shipper.start()
         threading.Thread(target=worker_heartbeat_loop, args=(wtoken, state), daemon=True).start()
-        log(f"worker mode v{AGENT_VERSION}: polling every {POLL_INTERVAL}s")
+        log(f"worker mode v{AGENT_VERSION}: long poll {POLL_WAIT}s, retry every {POLL_INTERVAL}s on errors")
 
         while not _stop.is_set():
             if RENDER_MODE == "secure" and not renderer_available():
@@ -2107,8 +2108,15 @@ def main() -> int:
                 _stop.wait(POLL_INTERVAL)
                 continue
 
+            pause = POLL_INTERVAL
             try:
-                r = api("POST", "/agent/poll?supports=lora_try", wtoken)
+                started = time.monotonic()
+                r = api(
+                    "POST",
+                    f"/agent/poll?supports=lora_try&wait={POLL_WAIT}",
+                    wtoken,
+                    timeout=POLL_WAIT + 15,
+                )
                 if r.status_code == 200 and r.json():
                     claim = r.json()
                     cid = str(claim["chunk_id"]) if claim.get("chunk_id") else None
@@ -2162,15 +2170,21 @@ def main() -> int:
                             state["presence"] = "draining"
                         else:
                             state["presence"] = "idle"
+                    pause = 0
                 elif r.status_code == 401:
                     log("worker token invalid or revoked — exiting")
                     _worker_log_shipper.close()
                     return 1
+                elif r.status_code == 200:
+                    state["presence"] = "draining" if _run_policy == "drain" else "idle"
+                    if time.monotonic() - started >= 2:
+                        pause = 0
                 else:
                     state["presence"] = "draining" if _run_policy == "drain" else "idle"
             except requests.RequestException as e:
                 log(f"poll failed (will retry): {e}")
-            _stop.wait(POLL_INTERVAL)
+            if pause:
+                _stop.wait(pause)
         _worker_log_shipper.close()
         return 0
 
