@@ -1,4 +1,4 @@
-"""Resident evaluation model for a friend's GPU.
+"""Resident evaluation model for a trusted host.
 
 One container stays up for HOLD_SECONDS after the last prompt. A training claim
 or an Unload command stops it before anything else uses the card. A MilliCloud
@@ -41,14 +41,14 @@ class EvalCache:
             return None
         meta = self.root() / "meta.json"
         if not meta.is_file():
-            return {"state": "loading", "hold_seconds": HOLD_SECONDS, "host": "friend"}
+            return {"state": "loading", "hold_seconds": HOLD_SECONDS, "host": "trusted"}
         try:
             data = json.loads(meta.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"state": "loading", "hold_seconds": HOLD_SECONDS, "host": "friend"}
+            return {"state": "loading", "hold_seconds": HOLD_SECONDS, "host": "trusted"}
         if not isinstance(data, dict):
             return None
-        data["host"] = "friend"
+        data["host"] = "trusted"
         data["hold_seconds"] = int(data.get("hold_seconds") or HOLD_SECONDS)
         return data
 

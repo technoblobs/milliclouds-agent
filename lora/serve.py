@@ -1,6 +1,6 @@
 """Keep one 4-bit model loaded and answer evaluation prompts from /session/inbox.
 
-The agent uses this on a friend's GPU. A MilliCloud host does not. The process
+The agent uses this on a trusted host. A MilliCloud host does not. The process
 exits after EVAL_IDLE_SECONDS with no new prompt, or when /session/unload appears.
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ def meta(state: str, job: dict, loaded_at: float, last_used: float) -> None:
         "loaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(loaded_at)),
         "idle_seconds": max(0, int(now - last_used)),
         "hold_seconds": IDLE,
-        "host": "friend",
+        "host": "trusted",
     })
 
 
