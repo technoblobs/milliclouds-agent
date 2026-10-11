@@ -1034,6 +1034,24 @@ def run_lora_try(claim: dict) -> None:
         _post_lora_try(try_id, {"success": False, "error": err})
         raise RuntimeError(err)
 
+    if _eval_cache.same_adapter(claim):
+        try:
+            log(f"cached adapter {settings.get('adapter_label') or 'adapter'}, skip download")
+            saved = _eval_cache.answer_loaded(claim)
+            _post_lora_try(try_id, {
+                "success": True,
+                "base_text": str(saved.get("base") or "")[:8000],
+                "adapter_text": str(saved.get("adapter") or "")[:8000],
+            })
+            log("compare complete")
+            return
+        except Exception as e:
+            try:
+                _post_lora_try(try_id, {"success": False, "error": str(e)[:1900]})
+            except requests.RequestException:
+                pass
+            raise
+
     if RENDER_MODE == "secure":
         workdir = SANDBOX_ROOT / "jobs" / uuid.uuid4().hex
         workdir.mkdir(parents=True, exist_ok=True)

@@ -68,31 +68,72 @@ class EvalCache:
         for name in ("unload", "meta.json", "session.json"):
             (root / name).unlink(missing_ok=True)
 
+    def same_adapter(self, claim: dict) -> bool:
+        """True when this job's adapter is already the one loaded in the eval container."""
+        if not self.allowed() or not self._running():
+            return False
+        current = self.root() / "session.json"
+        if not current.is_file():
+            return False
+        try:
+            have = json.loads(current.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        settings = claim.get("engine_settings") or {}
+        want = self._signature(claim, settings, weight_bytes=have.get("adapter_bytes"))
+        if not have.get("job_id"):
+            return False
+        if int(settings.get("adapter_bytes") or 0) and int(have.get("source_bytes") or 0):
+            if int(have["source_bytes"]) != int(settings["adapter_bytes"]):
+                return False
+        return (
+            have.get("model_id") == want["model_id"]
+            and have.get("model_revision") == want["model_revision"]
+            and have.get("adapter_label") == want["adapter_label"]
+            and have.get("job_id") == want["job_id"]
+        )
+
+    def answer_loaded(self, claim: dict) -> dict:
+        settings = claim.get("engine_settings") or {}
+        try_id = str(settings.get("try_id") or "")
+        label = str(settings.get("adapter_label") or "")
+        with self._lock:
+            if not self.same_adapter(claim):
+                raise RuntimeError("try_failed: cached adapter changed before the prompt was sent")
+            self._write_prompt(try_id, settings.get("prompt") or "")
+        self.log(f"evaluation using cached adapter {label}")
+        return self._wait_result(try_id)
+
     def answer(self, claim: dict, weight: Path, config: Path, *, reclaim) -> dict:
         settings = claim.get("engine_settings") or {}
-        model_id = str(settings.get("model_id") or "")
-        revision = str(settings.get("model_revision") or "main")
         label = str(settings.get("adapter_label") or weight.name)
         image = str(settings.get("docker_image") or os.environ.get("LORA_DOCKER_IMAGE") or "millicloud-lora:qwen")
         try_id = str(settings.get("try_id") or "")
-        signature = {
-            "model_id": model_id,
-            "model_revision": revision,
-            "adapter_label": label,
-            "adapter_bytes": weight.stat().st_size,
-            "adapter_dir": "/session/adapter",
-        }
+        signature = self._signature(claim, settings, weight_bytes=weight.stat().st_size)
         with self._lock:
             self._ensure(signature, weight, config, image, reclaim)
-        root = self.root()
-        inbox = root / "inbox"
+            self._write_prompt(try_id, settings.get("prompt") or "")
+        self.log(f"evaluation using cached model {signature['model_id']} ({label})")
+        return self._wait_result(try_id)
+
+    def _signature(self, claim: dict, settings: dict, weight_bytes) -> dict:
+        return {
+            "job_id": str(claim.get("job_id") or ""),
+            "model_id": str(settings.get("model_id") or ""),
+            "model_revision": str(settings.get("model_revision") or "main"),
+            "adapter_label": str(settings.get("adapter_label") or ""),
+            "adapter_bytes": int(weight_bytes or 0),
+            "source_bytes": int(settings.get("adapter_bytes") or 0),
+            "adapter_dir": "/session/adapter",
+        }
+
+    def _write_prompt(self, try_id: str, prompt: str) -> None:
+        inbox = self.root() / "inbox"
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / f"{try_id}.json").write_text(
-            json.dumps({"prompt": settings.get("prompt") or ""}),
+            json.dumps({"prompt": prompt}),
             encoding="utf-8",
         )
-        self.log(f"evaluation using cached model {model_id} ({label})")
-        return self._wait_result(try_id)
 
     def _ensure(self, signature: dict, weight: Path, config: Path, image: str, reclaim) -> None:
         root = self.root()
@@ -106,6 +147,7 @@ class EvalCache:
                 have.get("model_id") == signature["model_id"]
                 and have.get("model_revision") == signature["model_revision"]
                 and have.get("adapter_label") == signature["adapter_label"]
+                and have.get("job_id") == signature["job_id"]
                 and have.get("adapter_bytes") == signature["adapter_bytes"]
             ):
                 return
