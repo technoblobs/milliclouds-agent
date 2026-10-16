@@ -306,7 +306,7 @@ def main() -> None:
     try:
         import torch
     except ImportError:
-        fail("no_libs", "PyTorch is not installed. Build millicloud-lora:qwen (see lora.md).")
+        fail("no_libs", "PyTorch is not installed. Build millicloud-lora:latest (see lora.md).")
     if not torch.cuda.is_available():
         fail("no_gpu", "LoRA training requires an NVIDIA GPU with CUDA")
 
@@ -335,7 +335,7 @@ def main() -> None:
             "no_libs",
             "training libraries missing ("
             + import_failure(e)
-            + "). Rebuild millicloud-lora:qwen and wait for 'trainer torch ok'.",
+            + "). Rebuild millicloud-lora:latest and wait for 'trainer torch ok'.",
         )
 
     prompt_field = str(dataset_spec.get("prompt_field") or "prompt")

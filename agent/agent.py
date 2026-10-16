@@ -981,7 +981,7 @@ def run_image(claim: dict, workdir: Path, init_image: Path | None, on_progress) 
     return files
 
 
-DEFAULT_LORA_DOCKER = os.environ.get("LORA_DOCKER_IMAGE", "millicloud-lora:qwen")
+DEFAULT_LORA_DOCKER = os.environ.get("LORA_DOCKER_IMAGE", "millicloud-lora:latest")
 
 
 def lora_train_script() -> Path:
@@ -1026,7 +1026,7 @@ def run_lora_try(claim: dict) -> None:
         _post_lora_try(try_id, {"success": False, "error": err})
         raise RuntimeError(err)
     if not shutil.which("docker"):
-        err = "no_libs: Docker is required. Build millicloud-lora:qwen on this host."
+        err = "no_libs: Docker is required. Build millicloud-lora:latest on this host."
         _post_lora_try(try_id, {"success": False, "error": err})
         raise RuntimeError(err)
     script = lora_infer_script()
@@ -1213,7 +1213,7 @@ def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoi
         raise RuntimeError("no_gpu: LoRA training runs on NVIDIA workers only")
     if not shutil.which("docker"):
         raise RuntimeError(
-            "no_libs: Docker is required. Build millicloud-lora:qwen on this host (see lora.md)."
+            "no_libs: Docker is required. Build millicloud-lora:latest on this host (see lora.md)."
         )
     if not dataset.is_file():
         raise RuntimeError("scene_error: LoRA dataset was not downloaded")

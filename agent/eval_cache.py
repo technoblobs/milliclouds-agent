@@ -107,7 +107,7 @@ class EvalCache:
     def answer(self, claim: dict, weight: Path, config: Path, *, reclaim) -> dict:
         settings = claim.get("engine_settings") or {}
         label = str(settings.get("adapter_label") or weight.name)
-        image = str(settings.get("docker_image") or os.environ.get("LORA_DOCKER_IMAGE") or "millicloud-lora:qwen")
+        image = str(settings.get("docker_image") or os.environ.get("LORA_DOCKER_IMAGE") or "millicloud-lora:latest")
         try_id = str(settings.get("try_id") or "")
         signature = self._signature(claim, settings, weight_bytes=weight.stat().st_size)
         with self._lock:

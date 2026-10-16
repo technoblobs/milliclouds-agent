@@ -3,7 +3,7 @@
 Fourth engine next to Blender, OpenFOAM, and image. The website queues a job,
 an NVIDIA worker claims one try, and the adapter uploads to the job page.
 
-The runtime stays `causal-qlora@1` (`millicloud-lora:qwen`). A new causal model
+The runtime stays `causal-qlora@1` (`millicloud-lora:latest`). A new causal model
 is a JSON template. SmolLM3, Gemma 4, and Phi-4 also need the trainer image in
 the section below.
 
@@ -78,7 +78,7 @@ reliably. Use the image below.
 ## Build the trainer image
 
 Build this on the NVIDIA Linux host. A Mac image cannot see the GPU. One tag,
-`millicloud-lora:qwen`, trains Qwen and the models above. The pins live in
+`millicloud-lora:latest`, trains Qwen and the models above. The pins live in
 `milliclouds-agent/lora/Dockerfile`:
 
 ```dockerfile
@@ -113,11 +113,11 @@ checkout, then build. On the Fedora host that is `~/work/milliclouds-agent`:
 
 ```bash
 cd ~/work/milliclouds-agent
-docker build --platform linux/amd64 -t millicloud-lora:qwen lora/
+docker build --platform linux/amd64 -t millicloud-lora:latest lora/
 ```
 
 Leave the agent running. It reads `train.py` from the checkout on the next
-job, and the next `docker run` uses the new `millicloud-lora:qwen` tag. Queue
+job, and the next `docker run` uses the new `millicloud-lora:latest` tag. Queue
 again only after the build prints `trainer torch ok`. Weights still cache in
 `~/.cache/millicloud-lora`.
 The first Gemma 4 or Phi-4 job downloads that model's weights. Qwen jobs keep

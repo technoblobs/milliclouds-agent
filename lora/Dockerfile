@@ -1,8 +1,8 @@
 # LoRA trainer (train.py). Build on NVIDIA Linux, not a Mac.
 #
-#   docker build -t millicloud-lora:qwen lora/
+#   docker build -t millicloud-lora:latest lora/
 #
-# Agent env: LORA_DOCKER_IMAGE=millicloud-lora:qwen
+# Agent env: LORA_DOCKER_IMAGE=millicloud-lora:latest
 # Base weights download on first job into LORA_CACHE. They are not in this image.
 #
 # transformers 5.19 loads SmolLM3, Phi-4, and Gemma 4 (12B needs >= 5.10).
