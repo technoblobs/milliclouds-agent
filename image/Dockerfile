@@ -1,23 +1,18 @@
-# NVIDIA Linux/Vast worker only. Do NOT build this on an Apple Silicon Mac:
-# Docker Desktop's VM fills up (~60 GB), and CUDA cannot use Metal anyway.
-# On a Mac run:  image/setup-macos.sh
+# Image-gen runner (generate.py). Build on NVIDIA Linux / Vast, not a Mac.
 #
-# Build on an NVIDIA host:
-#   docker build --platform linux/amd64 -t millicloud-image:klein image/
+#   docker build -t milliclouds/worker:image .
+#   docker push milliclouds/worker:image
 #
-# Weights are NOT baked in (downloaded on first job).
-FROM --platform=linux/amd64 nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# Agent env: IMAGE_DOCKER_IMAGE=milliclouds/worker:image
+# Weights are NOT in this image (downloaded on first job into IMAGE_CACHE).
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN python3 -m pip install --no-cache-dir --upgrade pip \
- && python3 -m pip install --no-cache-dir \
-      torch --index-url https://download.pytorch.org/whl/cu124 \
- && python3 -m pip install --no-cache-dir \
-      "git+https://github.com/huggingface/diffusers.git" \
-      transformers accelerate safetensors sentencepiece protobuf pillow huggingface_hub
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir \
+         "git+https://github.com/huggingface/diffusers.git" \
+         transformers accelerate safetensors sentencepiece protobuf pillow huggingface_hub
 
 COPY generate.py /opt/image/generate.py
 COPY NOTICE /opt/image/NOTICE

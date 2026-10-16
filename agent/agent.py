@@ -29,8 +29,11 @@ from pathlib import Path
 
 import requests
 
+from eval_cache import EvalCache
+
 API = os.environ.get("RY_API", "").rstrip("/")
 POLL_INTERVAL = int(os.environ.get("RY_POLL_INTERVAL", "10"))
+POLL_WAIT = max(0, min(20, int(os.environ.get("RY_POLL_WAIT", "20"))))
 HEARTBEAT_INTERVAL = 20
 WORKER_HB_INTERVAL = 25
 LOG_FLUSH_INTERVAL = float(os.environ.get("RY_LOG_FLUSH_INTERVAL", "1.0"))
@@ -77,6 +80,9 @@ _status: dict = {
 }
 
 
+_eval_cache = EvalCache(log=lambda msg: print(f"[agent] {msg}", flush=True))
+
+
 def log(msg: str) -> None:
     line = f"[agent] {msg}"
     print(line, flush=True)
@@ -84,6 +90,9 @@ def log(msg: str) -> None:
         _log_shipper.add(line)
     elif _worker_log_shipper is not None:
         _worker_log_shipper.add(line)
+
+
+_eval_cache.log = log
 
 
 def _control_status() -> dict:
@@ -170,11 +179,11 @@ def start_control_panel() -> None:
     )
 
 
-def api(method: str, path: str, token: str, **kw) -> requests.Response:
+def api(method: str, path: str, token: str, timeout: int = 30, **kw) -> requests.Response:
     return requests.request(
         method, f"{API}{path}",
         headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
+        timeout=timeout,
         **kw,
     )
 
@@ -199,6 +208,8 @@ def classify_error(exc: BaseException) -> str:
         return "no_disk" if "disk" in s or "no_disk" in s else "no_libs"
     if "flux" in s or "image job" in s or s.startswith("image_failed") or s.startswith("model_load"):
         return "image_failed"
+    if "lora" in s or s.startswith("lora_failed"):
+        return "lora_failed"
     if "unsafe path" in s or "extraction" in s or "archive" in s:
         return "scene_error"
     if "lease" in s or "reassigned" in s or "409" in s:
@@ -970,6 +981,384 @@ def run_image(claim: dict, workdir: Path, init_image: Path | None, on_progress) 
     return files
 
 
+DEFAULT_LORA_DOCKER = os.environ.get("LORA_DOCKER_IMAGE", "millicloud-lora:latest")
+
+
+def lora_train_script() -> Path:
+    env = os.environ.get("LORA_TRAIN")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parent
+    for p in (
+        here.parent / "lora" / "train.py",
+        here / "train.py",
+        Path("/opt/lora/train.py"),
+    ):
+        if p.is_file():
+            return p
+    return here.parent / "lora" / "train.py"
+
+
+def lora_infer_script() -> Path:
+    env = os.environ.get("LORA_INFER")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parent
+    for p in (here.parent / "lora" / "infer.py", here / "infer.py"):
+        if p.is_file():
+            return p
+    return here.parent / "lora" / "infer.py"
+
+
+def _post_lora_try(try_id: str, payload: dict) -> None:
+    token = os.environ.get("RY_WORKER_TOKEN") or ""
+    api("POST", f"/agent/tries/{try_id}/complete", token, json=payload).raise_for_status()
+
+
+def run_lora_try(claim: dict) -> None:
+    """Generate the base answer and the adapter answer for one prompt."""
+    settings = claim.get("engine_settings") or {}
+    try_id = str(settings.get("try_id") or "")
+    if not try_id:
+        raise RuntimeError("try_failed: claim is missing try_id")
+    if sys.platform == "darwin" or not has_nvidia():
+        err = "no_gpu: comparing an adapter runs on NVIDIA workers only"
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+    if not shutil.which("docker"):
+        err = "no_libs: Docker is required. Build millicloud-lora:latest on this host."
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+    script = lora_infer_script()
+    if not script.is_file():
+        err = "no_libs: lora/infer.py is missing next to the agent"
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+
+    if _eval_cache.same_adapter(claim):
+        try:
+            log(f"cached adapter {settings.get('adapter_label') or 'adapter'}, skip download")
+            saved = _eval_cache.answer_loaded(claim)
+            _post_lora_try(try_id, {
+                "success": True,
+                "base_text": str(saved.get("base") or "")[:8000],
+                "adapter_text": str(saved.get("adapter") or "")[:8000],
+            })
+            log("compare complete")
+            return
+        except Exception as e:
+            try:
+                _post_lora_try(try_id, {"success": False, "error": str(e)[:1900]})
+            except requests.RequestException:
+                pass
+            raise
+
+    if RENDER_MODE == "secure":
+        workdir = SANDBOX_ROOT / "jobs" / uuid.uuid4().hex
+        workdir.mkdir(parents=True, exist_ok=True)
+    elif RENDER_MODE == "trusted":
+        workdir = Path(tempfile.mkdtemp(prefix="ry_try_"))
+    else:
+        err = f"try_failed: unsupported RY_RENDER_MODE {RENDER_MODE}"
+        _post_lora_try(try_id, {"success": False, "error": err})
+        raise RuntimeError(err)
+    try:
+        adapter_dir = workdir / "adapter"
+        out_dir = workdir / "out"
+        adapter_dir.mkdir()
+        out_dir.mkdir()
+        if settings.get("checkpoint_url"):
+            archive = workdir / "checkpoint.zip"
+            download_scene(settings["checkpoint_url"], archive)
+            extracted = workdir / "ckpt"
+            extracted.mkdir()
+            safe_extract(archive, extracted)
+            weight = next(extracted.rglob("adapter_model.safetensors"), None)
+            config = next(extracted.rglob("adapter_config.json"), None)
+            if weight is None or config is None:
+                raise RuntimeError("try_failed: checkpoint has no adapter files")
+            shutil.copy(weight, adapter_dir / "adapter_model.safetensors")
+            shutil.copy(config, adapter_dir / "adapter_config.json")
+        else:
+            download_scene(settings["adapter_url"], adapter_dir / "adapter_model.safetensors")
+            download_scene(settings["adapter_config_url"], adapter_dir / "adapter_config.json")
+        if _eval_cache.allowed():
+            saved = _eval_cache.answer(claim, adapter_dir / "adapter_model.safetensors", adapter_dir / "adapter_config.json", reclaim=_reclaim_mount)
+            _post_lora_try(try_id, {
+                "success": True,
+                "base_text": str(saved.get("base") or "")[:8000],
+                "adapter_text": str(saved.get("adapter") or "")[:8000],
+            })
+            log("compare complete")
+            return
+        shutil.copy(script, workdir / "infer.py")
+        job = {
+            "prompt": settings.get("prompt") or "",
+            "model_id": settings.get("model_id") or "",
+            "model_revision": settings.get("model_revision") or "main",
+            "adapter_dir": "/work/adapter",
+            "output": "/work/out/try_result.json",
+        }
+        (workdir / "lora-try.json").write_text(json.dumps(job), encoding="utf-8")
+        image = settings.get("docker_image") or DEFAULT_LORA_DOCKER
+        cache = Path(os.environ.get("LORA_CACHE") or (Path.home() / ".cache" / "millicloud-lora"))
+        cache.mkdir(parents=True, exist_ok=True)
+        _reclaim_mount(cache, image)
+        _reclaim_mount(workdir, image)
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--security-opt", "label=disable",
+            "--entrypoint", "python3",
+            "-v", f"{workdir.resolve()}:/work",
+            "-v", f"{cache.resolve()}:/cache",
+            "-e", "HF_HOME=/cache/hf",
+            "-e", "HOME=/tmp",
+            "-e", "PYTHONUNBUFFERED=1",
+            image, "/work/infer.py", "--job", "/work/lora-try.json",
+        ]
+        log(f"lora compare docker {image}")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            print(line, flush=True)
+            if render_should_stop():
+                proc.terminate()
+                proc.wait()
+                raise RuntimeError("Render aborted by operator")
+        code = proc.wait()
+        result_path = out_dir / "try_result.json"
+        if code != 0 or not result_path.is_file():
+            raise RuntimeError(f"try_failed: compare exited with code {code}")
+        saved = json.loads(result_path.read_text(encoding="utf-8"))
+        _post_lora_try(try_id, {
+            "success": True,
+            "base_text": str(saved.get("base") or "")[:8000],
+            "adapter_text": str(saved.get("adapter") or "")[:8000],
+        })
+        log("compare complete")
+    except Exception as e:
+        try:
+            _post_lora_try(try_id, {"success": False, "error": str(e)[:1900]})
+        except requests.RequestException:
+            pass
+        raise
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _zip_latest_checkpoint(ckpt_dir: Path, dest: Path) -> Path | None:
+    """Pack the newest Trainer checkpoint-* directory. Skip if nothing was saved yet."""
+    if not ckpt_dir.is_dir():
+        return None
+    found = sorted(p for p in ckpt_dir.glob("checkpoint-*") if p.is_dir())
+    if not found:
+        return None
+    latest = found[-1]
+    if dest.exists():
+        dest.unlink()
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in latest.rglob("*"):
+            if path.is_file():
+                zf.write(path, arcname=str(Path(latest.name) / path.relative_to(latest)))
+    return dest
+
+
+def _owned_by_user(path: Path) -> bool:
+    uid = os.getuid()
+    for dirpath, _dirnames, filenames in os.walk(path):
+        if Path(dirpath).stat().st_uid != uid:
+            return False
+        for name in filenames:
+            if (Path(dirpath) / name).stat().st_uid != uid:
+                return False
+    return True
+
+
+def _reclaim_mount(path: Path, image: str) -> None:
+    """A root container leaves root-owned files on the bind mount. The host user cannot read them."""
+    if _owned_by_user(path):
+        return
+    log(f"reclaiming root-owned files under {path}")
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--entrypoint", "chown",
+            "--security-opt", "label=disable",
+            "-v", f"{path.resolve()}:/data",
+            image,
+            "-R", f"{os.getuid()}:{os.getgid()}", "/data",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"no_libs: could not reclaim {path}: {detail}")
+
+
+def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoint) -> tuple[list[Path], dict]:
+    """One QLoRA try. NVIDIA Docker only — Mac workers must not reach this."""
+    if sys.platform == "darwin" or not has_nvidia():
+        raise RuntimeError("no_gpu: LoRA training runs on NVIDIA workers only")
+    if not shutil.which("docker"):
+        raise RuntimeError(
+            "no_libs: Docker is required. Build millicloud-lora:latest on this host (see lora.md)."
+        )
+    if not dataset.is_file():
+        raise RuntimeError("scene_error: LoRA dataset was not downloaded")
+
+    settings = claim.get("engine_settings") or {}
+    trial = settings.get("trial") or {}
+    try_no = int(claim.get("frame_start") or 1)
+    out_dir = workdir / "out"
+    ckpt_dir = workdir / "ckpt"
+    out_dir.mkdir(exist_ok=True)
+    ckpt_dir.mkdir(exist_ok=True)
+
+    resume_for_job = None
+    ckpt_url = claim.get("checkpoint_url")
+    if ckpt_url:
+        archive = workdir / "resume.zip"
+        download_scene(ckpt_url, archive)
+        resume_dir = workdir / "resume"
+        resume_dir.mkdir(exist_ok=True)
+        safe_extract(archive, resume_dir)
+        resume_for_job = "/work/resume"
+        log(f"lora resume archive for try {try_no}")
+
+    job = {
+        "dataset": "/work/" + dataset.name,
+        "output_dir": "/work/out",
+        "checkpoint_dir": "/work/ckpt",
+        "model_id": settings.get("model_id") or "",
+        "model_revision": settings.get("model_revision") or "main",
+        "hardware": settings.get("hardware") or {},
+        "dataset_spec": settings.get("dataset") or {},
+        "recipe": settings.get("recipe") or {},
+        "trial": {
+            "rank": int(trial.get("rank") or settings.get("rank") or 16),
+            "lr": float(trial.get("lr") or settings.get("lr") or 2e-4),
+            "epochs": int(trial.get("epochs") or settings.get("epochs") or 1),
+            "max_seq": int(trial.get("max_seq") or settings.get("max_seq") or 2048),
+        },
+        "loss_on": settings.get("loss_on") or "full",
+        "early_stop": settings.get("early_stop", True),
+        "early_stop_patience": int(settings.get("early_stop_patience") or 2),
+        "eval_tail": int(settings.get("eval_tail") or 0),
+    }
+    if resume_for_job:
+        job["resume"] = resume_for_job
+    job_path = workdir / "lora-job.json"
+    job_path.write_text(json.dumps(job, indent=2))
+
+    script = lora_train_script()
+    image = settings.get("docker_image") or DEFAULT_LORA_DOCKER
+    cache = Path(os.environ.get("LORA_CACHE") or (Path.home() / ".cache" / "millicloud-lora"))
+    cache.mkdir(parents=True, exist_ok=True)
+    # The image has no USER, so Docker writes the adapter as root. On Fedora,
+    # SELinux also labels that mount so the agent cannot open it. Run as the
+    # host user and keep the directory label.
+    _reclaim_mount(cache, image)
+    _reclaim_mount(workdir, image)
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--security-opt", "label=disable",
+        "-v", f"{workdir.resolve()}:/work",
+        "-v", f"{cache.resolve()}:/cache",
+        "-e", "HF_HOME=/cache/hf",
+        "-e", "HOME=/tmp",
+        "-e", "PYTHONUNBUFFERED=1",
+    ]
+    if script.is_file():
+        cmd += ["-v", f"{script.resolve()}:/opt/lora/train.py:ro"]
+    cmd += [image, "--job", "/work/lora-job.json"]
+    log(f"lora docker {image} try={try_no} rank={job['trial']['rank']}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    metrics: dict = {}
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            print(line, flush=True)
+            if _log_shipper is not None:
+                _log_shipper.add(line)
+            if line.startswith("[lora] progress "):
+                try:
+                    on_progress(max(0.0, min(1.0, float(line.split()[2]))))
+                except (IndexError, ValueError):
+                    pass
+            elif line.startswith("[lora] val_loss "):
+                try:
+                    metrics["val_loss"] = float(line.split()[2])
+                except (IndexError, ValueError):
+                    pass
+            elif line.startswith("[lora] checkpoint "):
+                packed = _zip_latest_checkpoint(ckpt_dir, workdir / f"checkpoint-t{try_no}.zip")
+                if packed is not None:
+                    try:
+                        on_checkpoint(packed)
+                    except Exception as e:
+                        log(f"checkpoint upload failed (training continues): {e}")
+            if render_should_stop():
+                proc.terminate()
+                raise RuntimeError("Render aborted by operator")
+    finally:
+        proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"lora job exited with code {proc.returncode}")
+
+    result_path = out_dir / "train_result.json"
+    if result_path.is_file():
+        try:
+            saved = json.loads(result_path.read_text())
+            if "val_loss" in saved:
+                metrics["val_loss"] = float(saved["val_loss"])
+            if "global_step" in saved:
+                metrics["global_step"] = int(saved["global_step"])
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    adapter = out_dir / "adapter_model.safetensors"
+    config = out_dir / "adapter_config.json"
+    if not adapter.is_file():
+        raise RuntimeError("lora_failed: adapter_model.safetensors was not written")
+    adapter_dest = out_dir / f"adapter-t{try_no}.safetensors"
+    adapter.rename(adapter_dest)
+    files = [adapter_dest]
+    if config.is_file():
+        config_dest = out_dir / f"adapter-t{try_no}.config.json"
+        config.rename(config_dest)
+        files.append(config_dest)
+    if result_path.is_file():
+        result_dest = out_dir / f"train-t{try_no}.json"
+        result_path.rename(result_dest)
+        files.append(result_dest)
+    return files, metrics
+
+
 GPU_ENABLE_EXPR = (
     "import bpy;"
     "p=bpy.context.preferences.addons['cycles'].preferences;"
@@ -1408,7 +1797,9 @@ def upload_outputs(job_id: str, token: str, files: list[Path]) -> None:
         r.raise_for_status()
         put_url = r.json()["upload_url"]
         with open(f, "rb") as fh:
-            up = requests.put(put_url, data=fh, headers={"Content-Length": str(size)}, timeout=600)
+            # Adapters and checkpoints are larger than a PNG.
+            timeout = 3600 if size > 64 * 1024**2 else 600
+            up = requests.put(put_url, data=fh, headers={"Content-Length": str(size)}, timeout=timeout)
             up.raise_for_status()
         log(f"uploaded {f.name} ({size} bytes)")
 
@@ -1479,6 +1870,19 @@ def run_job(claim: dict, token: str) -> None:
                 state["frames"] = max(state["frames"], int(p * 100))
 
             to_upload = run_image(claim, workdir, init, on_progress=_img_progress)
+        elif engine == "lora":
+            def _lora_progress(p: float) -> None:
+                state["progress"] = p
+                state["frames"] = max(state["frames"], int(p * 100))
+
+            def _lora_checkpoint(path: Path) -> None:
+                upload_outputs(job_id, token, [path])
+
+            to_upload, lora_metrics = run_lora(
+                claim, workdir, scene, on_progress=_lora_progress, on_checkpoint=_lora_checkpoint,
+            )
+            if lora_metrics:
+                state["metrics"] = lora_metrics
         elif engine == "openfoam":
             if scene.suffix != ".zip":
                 raise RuntimeError("OpenFOAM jobs must be a .zip of the case directory")
@@ -1540,6 +1944,8 @@ def run_job(claim: dict, token: str) -> None:
         }
         if chunk_id:
             body["chunk_id"] = chunk_id
+        if state.get("metrics"):
+            body["metrics"] = state["metrics"]
         log("chunk/job complete ✔")
         # Flush shipper before complete so the last lines are not 409'd.
         shipper.close()
@@ -1586,6 +1992,7 @@ def worker_heartbeat_loop(wtoken: str, state: dict) -> None:
             _runtime_metrics = collect_runtime_metrics()
             specs["runtime_metrics"] = dict(_runtime_metrics)
             specs["render_mode"] = RENDER_MODE
+            specs["lora_cache"] = _eval_cache.status()
             specs["sandbox"] = {
                 "mode": RENDER_MODE,
                 "sidecar_required": RENDER_MODE == "secure",
@@ -1627,8 +2034,11 @@ def worker_heartbeat_loop(wtoken: str, state: dict) -> None:
             if r.status_code == 200:
                 data = r.json()
                 _run_policy = data.get("run_policy") or _run_policy
+                _eval_cache.provider = data.get("provider") or _eval_cache.provider
                 if data.get("command") == "abort_current":
                     abort_current_render("server command")
+                elif data.get("command") == "unload_eval":
+                    _eval_cache.unload("operator")
                 if data.get("render_mode") and data["render_mode"] != RENDER_MODE:
                     log(
                         f"render mode mismatch: API requires {data['render_mode']}, "
@@ -1672,7 +2082,7 @@ def main() -> int:
         _worker_log_shipper = WorkerLogShipper(wtoken)
         _worker_log_shipper.start()
         threading.Thread(target=worker_heartbeat_loop, args=(wtoken, state), daemon=True).start()
-        log(f"worker mode v{AGENT_VERSION}: polling every {POLL_INTERVAL}s")
+        log(f"worker mode v{AGENT_VERSION}: long poll {POLL_WAIT}s, retry every {POLL_INTERVAL}s on errors")
 
         while not _stop.is_set():
             if RENDER_MODE == "secure" and not renderer_available():
@@ -1698,8 +2108,15 @@ def main() -> int:
                 _stop.wait(POLL_INTERVAL)
                 continue
 
+            pause = POLL_INTERVAL
             try:
-                r = api("POST", "/agent/poll", wtoken)
+                started = time.monotonic()
+                r = api(
+                    "POST",
+                    f"/agent/poll?supports=lora_try&wait={POLL_WAIT}",
+                    wtoken,
+                    timeout=POLL_WAIT + 15,
+                )
                 if r.status_code == 200 and r.json():
                     claim = r.json()
                     cid = str(claim["chunk_id"]) if claim.get("chunk_id") else None
@@ -1712,11 +2129,18 @@ def main() -> int:
                     state["presence"] = "busy"
                     state["job_id"] = str(claim["job_id"])
                     state["chunk_id"] = str(claim["chunk_id"]) if claim.get("chunk_id") else None
-                    log(f"claimed chunk {state['chunk_id']} job {state['job_id']} "
-                        f"frames {claim['frame_start']}-{claim['frame_end']}")
+                    if claim.get("engine") == "lora_try":
+                        log(f"claimed compare job {state['job_id']}")
+                    else:
+                        log(f"claimed chunk {state['chunk_id']} job {state['job_id']} "
+                            f"frames {claim['frame_start']}-{claim['frame_end']}")
                     try:
                         _abort_render.clear()
-                        run_job(claim, claim["job_token"])
+                        if claim.get("engine") == "lora_try":
+                            run_lora_try(claim)
+                        else:
+                            _eval_cache.unload("training job claimed")
+                            run_job(claim, claim["job_token"])
                         state["presence"] = "idle"
                         _status["presence"] = "idle"
                         log("chunk finished — back to idle")
@@ -1746,15 +2170,21 @@ def main() -> int:
                             state["presence"] = "draining"
                         else:
                             state["presence"] = "idle"
+                    pause = 0
                 elif r.status_code == 401:
                     log("worker token invalid or revoked — exiting")
                     _worker_log_shipper.close()
                     return 1
+                elif r.status_code == 200:
+                    state["presence"] = "draining" if _run_policy == "drain" else "idle"
+                    if time.monotonic() - started >= 2:
+                        pause = 0
                 else:
                     state["presence"] = "draining" if _run_policy == "drain" else "idle"
             except requests.RequestException as e:
                 log(f"poll failed (will retry): {e}")
-            _stop.wait(POLL_INTERVAL)
+            if pause:
+                _stop.wait(pause)
         _worker_log_shipper.close()
         return 0
 
