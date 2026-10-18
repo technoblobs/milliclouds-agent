@@ -1004,10 +1004,15 @@ def lora_infer_script() -> Path:
     if env:
         return Path(env)
     here = Path(__file__).resolve().parent
-    for p in (here.parent / "lora" / "infer.py", here / "infer.py"):
+    for p in (here.parent / "lora" / "infer.py", here / "infer.py", Path("/opt/lora/infer.py")):
         if p.is_file():
             return p
     return here.parent / "lora" / "infer.py"
+
+
+def lora_local() -> bool:
+    """True inside the self-contained image. The host agent leaves this unset and uses Docker."""
+    return os.environ.get("LORA_RUNNER", "docker").strip().lower() == "local"
 
 
 def _post_lora_try(try_id: str, payload: dict) -> None:
@@ -1025,7 +1030,7 @@ def run_lora_try(claim: dict) -> None:
         err = "no_gpu: comparing an adapter runs on NVIDIA workers only"
         _post_lora_try(try_id, {"success": False, "error": err})
         raise RuntimeError(err)
-    if not shutil.which("docker"):
+    if not lora_local() and not shutil.which("docker"):
         err = "no_libs: Docker is required. Build millicloud-lora:latest on this host."
         _post_lora_try(try_id, {"success": False, "error": err})
         raise RuntimeError(err)
@@ -1092,32 +1097,42 @@ def run_lora_try(claim: dict) -> None:
             log("compare complete")
             return
         shutil.copy(script, workdir / "infer.py")
+        local = lora_local()
         job = {
             "prompt": settings.get("prompt") or "",
             "model_id": settings.get("model_id") or "",
             "model_revision": settings.get("model_revision") or "main",
-            "adapter_dir": "/work/adapter",
-            "output": "/work/out/try_result.json",
+            "adapter_dir": str(adapter_dir.resolve()) if local else "/work/adapter",
+            "output": str((out_dir / "try_result.json").resolve()) if local else "/work/out/try_result.json",
         }
-        (workdir / "lora-try.json").write_text(json.dumps(job), encoding="utf-8")
+        try_path = workdir / "lora-try.json"
+        try_path.write_text(json.dumps(job), encoding="utf-8")
         image = settings.get("docker_image") or DEFAULT_LORA_DOCKER
         cache = Path(os.environ.get("LORA_CACHE") or (Path.home() / ".cache" / "millicloud-lora"))
         cache.mkdir(parents=True, exist_ok=True)
-        _reclaim_mount(cache, image)
-        _reclaim_mount(workdir, image)
-        cmd = [
-            "docker", "run", "--rm", "--gpus", "all",
-            "--user", f"{os.getuid()}:{os.getgid()}",
-            "--security-opt", "label=disable",
-            "--entrypoint", "python3",
-            "-v", f"{workdir.resolve()}:/work",
-            "-v", f"{cache.resolve()}:/cache",
-            "-e", "HF_HOME=/cache/hf",
-            "-e", "HOME=/tmp",
-            "-e", "PYTHONUNBUFFERED=1",
-            image, "/work/infer.py", "--job", "/work/lora-try.json",
-        ]
-        log(f"lora compare docker {image}")
+        if local:
+            env = os.environ.copy()
+            env["HF_HOME"] = str((cache / "hf").resolve())
+            env["PYTHONUNBUFFERED"] = "1"
+            cmd = [sys.executable, str(script), "--job", str(try_path.resolve())]
+            log("lora compare local")
+        else:
+            _reclaim_mount(cache, image)
+            _reclaim_mount(workdir, image)
+            cmd = [
+                "docker", "run", "--rm", "--gpus", "all",
+                "--user", f"{os.getuid()}:{os.getgid()}",
+                "--security-opt", "label=disable",
+                "--entrypoint", "python3",
+                "-v", f"{workdir.resolve()}:/work",
+                "-v", f"{cache.resolve()}:/cache",
+                "-e", "HF_HOME=/cache/hf",
+                "-e", "HOME=/tmp",
+                "-e", "PYTHONUNBUFFERED=1",
+                image, "/work/infer.py", "--job", "/work/lora-try.json",
+            ]
+            log(f"lora compare docker {image}")
+            env = None
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1126,6 +1141,7 @@ def run_lora_try(claim: dict) -> None:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -1211,7 +1227,8 @@ def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoi
     """One QLoRA try. NVIDIA Docker only — Mac workers must not reach this."""
     if sys.platform == "darwin" or not has_nvidia():
         raise RuntimeError("no_gpu: LoRA training runs on NVIDIA workers only")
-    if not shutil.which("docker"):
+    local = lora_local()
+    if not local and not shutil.which("docker"):
         raise RuntimeError(
             "no_libs: Docker is required. Build millicloud-lora:latest on this host (see lora.md)."
         )
@@ -1234,13 +1251,13 @@ def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoi
         resume_dir = workdir / "resume"
         resume_dir.mkdir(exist_ok=True)
         safe_extract(archive, resume_dir)
-        resume_for_job = "/work/resume"
+        resume_for_job = str((workdir / "resume").resolve()) if local else "/work/resume"
         log(f"lora resume archive for try {try_no}")
 
     job = {
-        "dataset": "/work/" + dataset.name,
-        "output_dir": "/work/out",
-        "checkpoint_dir": "/work/ckpt",
+        "dataset": str(dataset.resolve()) if local else "/work/" + dataset.name,
+        "output_dir": str(out_dir.resolve()) if local else "/work/out",
+        "checkpoint_dir": str(ckpt_dir.resolve()) if local else "/work/ckpt",
         "model_id": settings.get("model_id") or "",
         "model_revision": settings.get("model_revision") or "main",
         "hardware": settings.get("hardware") or {},
@@ -1266,25 +1283,35 @@ def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoi
     image = settings.get("docker_image") or DEFAULT_LORA_DOCKER
     cache = Path(os.environ.get("LORA_CACHE") or (Path.home() / ".cache" / "millicloud-lora"))
     cache.mkdir(parents=True, exist_ok=True)
-    # The image has no USER, so Docker writes the adapter as root. On Fedora,
-    # SELinux also labels that mount so the agent cannot open it. Run as the
-    # host user and keep the directory label.
-    _reclaim_mount(cache, image)
-    _reclaim_mount(workdir, image)
-    cmd = [
-        "docker", "run", "--rm", "--gpus", "all",
-        "--user", f"{os.getuid()}:{os.getgid()}",
-        "--security-opt", "label=disable",
-        "-v", f"{workdir.resolve()}:/work",
-        "-v", f"{cache.resolve()}:/cache",
-        "-e", "HF_HOME=/cache/hf",
-        "-e", "HOME=/tmp",
-        "-e", "PYTHONUNBUFFERED=1",
-    ]
-    if script.is_file():
-        cmd += ["-v", f"{script.resolve()}:/opt/lora/train.py:ro"]
-    cmd += [image, "--job", "/work/lora-job.json"]
-    log(f"lora docker {image} try={try_no} rank={job['trial']['rank']}")
+    if local:
+        if not script.is_file():
+            raise RuntimeError(f"no_libs: {script} is missing")
+        env = os.environ.copy()
+        env["HF_HOME"] = str((cache / "hf").resolve())
+        env["PYTHONUNBUFFERED"] = "1"
+        cmd = [sys.executable, str(script), "--job", str(job_path.resolve())]
+        log(f"lora local try={try_no} rank={job['trial']['rank']}")
+    else:
+        # The image has no USER, so Docker writes the adapter as root. On Fedora,
+        # SELinux also labels that mount so the agent cannot open it. Run as the
+        # host user and keep the directory label.
+        _reclaim_mount(cache, image)
+        _reclaim_mount(workdir, image)
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--security-opt", "label=disable",
+            "-v", f"{workdir.resolve()}:/work",
+            "-v", f"{cache.resolve()}:/cache",
+            "-e", "HF_HOME=/cache/hf",
+            "-e", "HOME=/tmp",
+            "-e", "PYTHONUNBUFFERED=1",
+        ]
+        if script.is_file():
+            cmd += ["-v", f"{script.resolve()}:/opt/lora/train.py:ro"]
+        cmd += [image, "--job", "/work/lora-job.json"]
+        env = None
+        log(f"lora docker {image} try={try_no} rank={job['trial']['rank']}")
 
     proc = subprocess.Popen(
         cmd,
@@ -1294,6 +1321,7 @@ def run_lora(claim: dict, workdir: Path, dataset: Path, on_progress, on_checkpoi
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=env,
     )
     metrics: dict = {}
     try:
@@ -1799,7 +1827,12 @@ def upload_outputs(job_id: str, token: str, files: list[Path]) -> None:
         with open(f, "rb") as fh:
             # Adapters and checkpoints are larger than a PNG.
             timeout = 3600 if size > 64 * 1024**2 else 600
-            up = requests.put(put_url, data=fh, headers={"Content-Length": str(size)}, timeout=timeout)
+            up = requests.put(
+                put_url,
+                data=fh,
+                headers={"Content-Length": str(size), "Content-Type": "application/octet-stream"},
+                timeout=timeout,
+            )
             up.raise_for_status()
         log(f"uploaded {f.name} ({size} bytes)")
 

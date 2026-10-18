@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -18,12 +19,17 @@ HOLD_SECONDS = int(os.environ.get("EVAL_IDLE_SECONDS", "600"))
 CONTAINER = "millicloud-eval"
 
 
+def _local() -> bool:
+    return os.environ.get("LORA_RUNNER", "docker").strip().lower() == "local"
+
+
 class EvalCache:
     def __init__(self, log) -> None:
         self.log = log
         self.provider = "user"
         self.render_mode = os.environ.get("RY_RENDER_MODE", "secure").lower()
         self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
 
     def allowed(self) -> bool:
         if os.environ.get("EVAL_CACHE", "1") == "0":
@@ -63,8 +69,19 @@ class EvalCache:
         root = self.root()
         root.mkdir(parents=True, exist_ok=True)
         (root / "unload").write_text("1", encoding="utf-8")
-        subprocess.run(["docker", "stop", "-t", "30", CONTAINER], capture_output=True, text=True)
-        subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True, text=True)
+        if _local():
+            proc = self._proc
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+            self._proc = None
+        else:
+            subprocess.run(["docker", "stop", "-t", "30", CONTAINER], capture_output=True, text=True)
+            subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True, text=True)
         for name in ("unload", "meta.json", "session.json"):
             (root / name).unlink(missing_ok=True)
 
@@ -124,7 +141,7 @@ class EvalCache:
             "adapter_label": str(settings.get("adapter_label") or ""),
             "adapter_bytes": int(weight_bytes or 0),
             "source_bytes": int(settings.get("adapter_bytes") or 0),
-            "adapter_dir": "/session/adapter",
+            "adapter_dir": str((self.root() / "adapter").resolve()) if _local() else "/session/adapter",
         }
 
     def _write_prompt(self, try_id: str, prompt: str) -> None:
@@ -172,6 +189,24 @@ class EvalCache:
                 raise RuntimeError(f"no_libs: {src} is missing next to the agent")
             shutil.copy(src, root / name)
         current.write_text(json.dumps(signature), encoding="utf-8")
+        if _local():
+            env = os.environ.copy()
+            env["EVAL_SESSION_ROOT"] = str(root.resolve())
+            env["HF_HOME"] = str((root.parent / "hf").resolve())
+            env["EVAL_IDLE_SECONDS"] = str(HOLD_SECONDS)
+            env["PYTHONUNBUFFERED"] = "1"
+            self._proc = subprocess.Popen(
+                [sys.executable, str(root / "serve.py")],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            self.log(f"cache starting {signature['model_id']} as {signature['adapter_label']} for {HOLD_SECONDS}s")
+            threading.Thread(target=self._follow_logs, name="eval-cache-logs", daemon=True).start()
+            return
         reclaim(root.parent, image)
         reclaim(root, image)
         uid = f"{os.getuid()}:{os.getgid()}"
@@ -196,6 +231,15 @@ class EvalCache:
         threading.Thread(target=self._follow_logs, name="eval-cache-logs", daemon=True).start()
 
     def _follow_logs(self) -> None:
+        if _local():
+            proc = self._proc
+            if proc is None or proc.stdout is None:
+                return
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    print(line, flush=True)
+            return
         proc = subprocess.Popen(
             ["docker", "logs", "-f", CONTAINER],
             stdout=subprocess.PIPE,
@@ -229,6 +273,9 @@ class EvalCache:
         raise RuntimeError("try_failed: cached model did not answer within 20 minutes")
 
     def _running(self) -> bool:
+        if _local():
+            proc = self._proc
+            return proc is not None and proc.poll() is None
         proc = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER],
             capture_output=True,

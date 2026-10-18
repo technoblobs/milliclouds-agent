@@ -56,7 +56,7 @@ Build on the GPU server. The tag is `millicloud-lora:latest`. Wait until the bui
 ```bash
 git clone https://github.com/technoblobs/milliclouds-agent.git
 cd milliclouds-agent
-docker build --platform linux/amd64 -t millicloud-lora:latest lora/
+docker build --platform linux/amd64 -f lora/Dockerfile -t millicloud-lora:latest .
 ```
 
 ## Create a host token
@@ -125,6 +125,21 @@ sudo systemctl enable --now millicloud-agent
 
 Do not commit `agent.env`. It holds the host token.
 
+## Rented GPU
+
+A Vast.ai container or a RunPod Pod is already the machine. Do not install a second Docker inside it. Start this image with the GPU and the same token. `WORKER_MODE=1` makes the container poll and run each job in that same environment.
+
+```bash
+docker run --gpus all --name millicloud-agent \
+  -e RY_API=https://api.milliclouds.com \
+  -e RY_WORKER_TOKEN=paste-the-token-once \
+  -e RY_RENDER_MODE=trusted \
+  -e WORKER_MODE=1 \
+  millicloud-lora:latest
+```
+
+The log says `lora local` when a version starts. One container is one host and needs its own token. The host setup above stays the right one for a machine you administer: the agent stays a small process and can mount a new `train.py` without rebuilding the image.
+
 ## Check that it is working
 
 - `systemctl status millicloud-agent` shows `active (running)`. A foreground run stays in the terminal.
@@ -149,5 +164,6 @@ Comparison questions for a finished adapter run on the same host. The first ques
 | `lora/` | Trainer image and the training, inference, and comparison scripts. |
 | `lora.md` | Model cards, VRAM floors, and template ids. |
 | `.env.example` | Variable names only. No tokens. |
+| `LICENSE` | MIT license for this agent and trainer. |
 
-Model weights keep the license of the checkpoint you download.
+This repository is MIT licensed. Model weights keep the license of the checkpoint you download. The MilliClouds website and API are not in this repository.

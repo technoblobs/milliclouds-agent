@@ -113,7 +113,7 @@ checkout, then build. On the Fedora host that is `~/work/milliclouds-agent`:
 
 ```bash
 cd ~/work/milliclouds-agent
-docker build --platform linux/amd64 -t millicloud-lora:latest lora/
+docker build --platform linux/amd64 -f lora/Dockerfile -t millicloud-lora:latest .
 ```
 
 Leave the agent running. It reads `train.py` from the checkout on the next

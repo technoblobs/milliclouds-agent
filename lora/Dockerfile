@@ -1,6 +1,6 @@
 # LoRA trainer (train.py). Build on NVIDIA Linux, not a Mac.
 #
-#   docker build -t millicloud-lora:latest lora/
+#   docker build --platform linux/amd64 -f lora/Dockerfile -t millicloud-lora:latest .
 #
 # Agent env: LORA_DOCKER_IMAGE=millicloud-lora:latest
 # Base weights download on first job into LORA_CACHE. They are not in this image.
@@ -15,6 +15,7 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir requests \
     && pip install --no-cache-dir \
          torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
          --index-url https://download.pytorch.org/whl/cu124 \
@@ -32,10 +33,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 # runs with no GPU, and docker build does not see the GPU. The job container
 # is started with --gpus all.
 
-COPY train.py /opt/lora/train.py
+# Build from the milliclouds-agent directory, not from lora/:
+#   docker build --platform linux/amd64 -f lora/Dockerfile -t millicloud-lora:latest .
+COPY lora/train.py lora/infer.py lora/serve.py /opt/lora/
+COPY lora/entrypoint.sh /opt/lora/entrypoint.sh
+COPY agent/agent.py agent/eval_cache.py /opt/agent/
+RUN chmod +x /opt/lora/entrypoint.sh && mkdir -p /cache /work
 
+# LORA_RUNNER=local applies only inside this image. A host-side agent does not
+# see it and still launches this image with docker run.
 ENV HF_HOME=/cache/hf \
+    LORA_CACHE=/cache \
+    LORA_RUNNER=local \
     PYTHONUNBUFFERED=1 \
     TRANSFORMERS_VERBOSITY=debug
 WORKDIR /work
-ENTRYPOINT ["python3", "/opt/lora/train.py"]
+ENTRYPOINT ["/opt/lora/entrypoint.sh"]
